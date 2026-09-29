@@ -18,11 +18,35 @@
 ```text
 contract-moniter/
 ├── binance.py                     # 数据获取、形态分析、排行和导出
+├── alpha_fdv.py                   # Alpha 低 FDV 交易对筛选（仅标准库）
 ├── README.md                      # 使用说明
 └── multi_exchange_oi_ranking.csv   # 运行后生成
 ```
 
-## 安装与运行
+## Alpha：查询 FDV 小于 100 万美元的交易对
+
+`alpha_fdv.py` 使用 Python 3 标准库，无需安装第三方依赖或配置 API Key：
+
+```powershell
+python alpha_fdv.py
+# 只看 USDT 交易对
+python alpha_fdv.py --quote USDT
+# 自定义美元上限和输出文件
+python alpha_fdv.py --max-fdv 500000 --output alpha_under_500k.csv
+```
+
+脚本读取 Alpha 代币列表中的 `fdv`，按 **`0 < FDV < 1000000`** 筛选，再将 `alphaId` 与交易信息的 `baseAsset` 匹配，仅输出状态为 `TRADING` 的真实交易对。默认包含所有计价币种，按 FDV 升序排列；同一代币有多个交易对时分别显示。FDV 缺失、非数字、非有限或非正数的记录会跳过，不使用流通市值代替 FDV。
+
+终端显示代币交易对、API 交易对代码（例如 `ALPHA_175USDT`）、美元 FDV 和链。完整结果写入当前工作目录的 `alpha_low_fdv.csv`，包含价格、流通市值、合约地址和 UTC 查询时间，采用 UTF-8 BOM 编码，覆盖同名文件。筛选成功但无匹配时仍导出表头；接口失败会报错并以非零状态退出，不会按“零个结果”处理。
+
+使用 Binance [Alpha Market Data 官方接口](https://developers.binance.com/en/docs/catalog/advanced-trading-alpha-trading/api/rest-api/market-data)：
+
+- `/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list`
+- `/bapi/defi/v1/public/alpha-trade/get-exchange-info`
+
+请求超时为 20 秒，网络错误、HTTP 429 或服务端错误最多尝试 3 次。支持 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量，配置方式见下文。FDV 是接口查询时的代币估值，两个接口并非同时采样；本脚本范围是 Alpha 交易信息接口列出的交易对，不包含仅出现在链上代币列表而没有匹配交易对的项目。
+
+## 合约持仓脚本：安装与运行
 
 需要 Python 3 和 `aiohttp`，并能够访问脚本使用的交易所公开接口。以下以 Windows PowerShell 为例，在项目根目录执行：
 
