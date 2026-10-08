@@ -9,14 +9,16 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 BASE_URL = "https://www.binance.com"
 TOKEN_PATH = "/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
 EXCHANGE_PATH = "/bapi/defi/v1/public/alpha-trade/get-exchange-info"
+TOKEN_SEARCH_PATH = "/bapi/defi/v5/public/wallet-direct/buw/wallet/market/token/search/ai"
 FIELDS = [
-    "交易对", "API交易对", "名称", "FDV_USD", "价格_USD", "流通市值_USD",
+    "交易对", "API交易对", "名称", "FDV_USD", "Top10占比", "价格_USD", "流通市值_USD",
     "链", "合约地址", "查询时间_UTC",
 ]
 
@@ -67,6 +69,51 @@ def fetch_data(path, timeout=20, attempts=3):
         return payload.get("data")
 
 
+def fetch_top10_percent(chain_id, address):
+    """按链和合约精确匹配；接口字段已经是百分数，不再乘以 100。"""
+    data = fetch_data(TOKEN_SEARCH_PATH + "?" + urlencode({
+        "keyword": address, "chainIds": chain_id,
+    }))
+    if not isinstance(data, list):
+        raise RuntimeError("Top10 查询响应格式异常")
+    for token in data:
+        if not isinstance(token, dict):
+            continue
+        candidate = str(token.get("contractAddress", ""))
+        matches = (candidate.lower() == address.lower()
+                   if address.startswith("0x") else candidate == address)
+        if str(token.get("chainId")) != str(chain_id) or not matches:
+            continue
+        try:
+            value = Decimal(str(token.get("holdersTop10Percent")))
+        except InvalidOperation:
+            return ""
+        if value.is_finite() and 0 <= value <= 100:
+            return f"{value:.2f}%"
+    return ""
+
+
+def enrich_top10(rows, tokens):
+    token_lookup = {
+        (token.get("chainName", token.get("chainId", "")),
+         token.get("contractAddress", "")): token for token in tokens
+    }
+    cache = {}
+    for row in rows:
+        token = token_lookup.get((row["链"], row["合约地址"]), {})
+        key = (str(token.get("chainId", "")), row["合约地址"])
+        if key not in cache:
+            cache[key] = ""
+            if all(key):
+                try:
+                    cache[key] = fetch_top10_percent(*key)
+                except RuntimeError as exc:
+                    print(f"警告：{row['交易对']} Top10 查询失败：{exc}", file=sys.stderr)
+            if not cache[key]:
+                print(f"警告：{row['交易对']} Top10 占比不可用，留空。", file=sys.stderr)
+        row["Top10占比"] = cache[key]
+
+
 def select_pairs(tokens, exchange, threshold, quote=None):
     if not isinstance(tokens, list) or not isinstance(exchange, dict):
         raise RuntimeError("接口 data 格式异常，无法筛选")
@@ -106,6 +153,7 @@ def select_pairs(tokens, exchange, threshold, quote=None):
             "API交易对": api_symbol,
             "名称": token.get("name", ""),
             "FDV_USD": fdv,
+            "Top10占比": "",
             "价格_USD": token.get("price", ""),
             "流通市值_USD": token.get("marketCap", ""),
             "链": token.get("chainName", token.get("chainId", "")),
@@ -118,8 +166,8 @@ def select_pairs(tokens, exchange, threshold, quote=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-fdv", type=parse_threshold, default=Decimal("1000000"),
-                        help="FDV 严格上限，单位美元，默认 1000000")
+    parser.add_argument("--max-fdv", type=parse_threshold, default=Decimal("2500000"),
+                        help="FDV 严格上限，单位美元，默认 2500000")
     parser.add_argument("--quote", type=str.upper, help="只查指定计价币种，例如 USDT")
     parser.add_argument("--output", type=Path, default=Path("alpha_low_fdv.csv"),
                         help="CSV 路径，默认 alpha_low_fdv.csv（覆盖同名文件）")
@@ -129,11 +177,14 @@ def main(argv=None):
         tokens = fetch_data(TOKEN_PATH)
         exchange = fetch_data(EXCHANGE_PATH)
         rows, invalid = select_pairs(tokens, exchange, args.max_fdv, args.quote)
+        print("正在查询前 10 大持币地址占比...")
+        enrich_top10(rows, tokens)
         print(f"FDV < ${args.max_fdv:,.2f}：共 {len(rows)} 个交易对；"
               f"跳过 {invalid} 条无效或非正 FDV 的代币记录。")
         for rank, row in enumerate(rows, 1):
             print(f"{rank:>3}. {row['交易对']:<22} {row['API交易对']:<22} "
-                  f"FDV=${row['FDV_USD']:>14,.2f}  链={row['链']}")
+                  f"FDV=${row['FDV_USD']:>14,.2f}  "
+                  f"Top10={row['Top10占比'] or 'N/A':>7}  链={row['链']}")
         with args.output.open("w", newline="", encoding="utf-8-sig") as file:
             writer = csv.DictWriter(file, fieldnames=FIELDS)
             writer.writeheader()
