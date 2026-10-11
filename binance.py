@@ -2,10 +2,24 @@ import asyncio
 import aiohttp
 import time
 import csv
+import math
+import re
+from urllib.parse import urlencode
 from typing import List, Dict, Any, Optional, Tuple, Set
 
 # 并发信号量（限制同时处理的币种并发请求数）
 CONCURRENCY_LIMIT = 15
+
+# Top10 是链上持币地址集中度，不是交易所合约账户持仓排名。
+TOP10_CONCURRENCY = 3
+TOP10_PRICE_TOLERANCE = 0.10
+TOP10_SEARCH_URL = (
+    'https://web3.binance.com/bapi/defi/v5/public/wallet-direct/'
+    'buw/wallet/market/token/search/ai'
+)
+# 同名或多链代币可按合约交易对指定数据来源：(chainId, contractAddress)。
+# 例如自行核实后填写：'XXXUSDT': ('1', '0x...')
+TOP10_TOKEN_OVERRIDES: Dict[str, Tuple[str, str]] = {}
 
 
 async def fetch_json(
@@ -40,6 +54,117 @@ async def fetch_json(
 # ============================================================
 # 币安基础数据
 # ============================================================
+
+def finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def top10_lookup_symbol(contract: str) -> Tuple[str, int]:
+    """拆分常见倍数合约，仅用于链上数据匹配，不改变原合约持仓计算。"""
+    base = contract[:-4] if contract.endswith('USDT') else contract
+    match = re.fullmatch(r'(1000000|100000|10000|1000)([A-Z][A-Z0-9]*)', base)
+    return (match[2], int(match[1])) if match else (base, 1)
+
+
+def top10_result(status: str, token: Optional[dict] = None) -> Dict[str, Any]:
+    token = token or {}
+    percent = finite_number(token.get('holdersTop10Percent'))
+    valid = percent is not None and 0 <= percent <= 100
+    return {
+        'top10_holders_ratio': percent / 100 if valid else None,
+        'top10_chain': str(token.get('chainId', '')),
+        'top10_address': token.get('contractAddress', ''),
+        'top10_status': status if valid or not token else '接口未提供有效Top10占比',
+    }
+
+
+def select_top10_token(
+        data: Any, contract: str, price: float,
+        override: Optional[Tuple[str, str]] = None
+) -> Dict[str, Any]:
+    """不按最大市值或第一条搜索结果猜测同名代币。"""
+    if not isinstance(data, dict) or data.get('code') != '000000' or data.get('success') is False:
+        return top10_result('接口请求失败')
+    tokens = data.get('data')
+    if not isinstance(tokens, list):
+        return top10_result('接口数据格式异常')
+    symbol, multiplier = top10_lookup_symbol(contract)
+    expected_price = finite_number(price)
+    if expected_price is not None:
+        expected_price /= multiplier
+    candidates = {}
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        chain = str(token.get('chainId', ''))
+        address = token.get('contractAddress')
+        if not chain or not isinstance(address, str) or not address:
+            continue
+        # EVM 十六进制地址不区分大小写；Solana 等地址保留大小写。
+        normalized_address = address.lower() if address.startswith('0x') else address
+        if override:
+            wanted = override[1].lower() if override[1].startswith('0x') else override[1]
+            if chain != str(override[0]) or normalized_address != wanted:
+                continue
+        else:
+            if str(token.get('symbol', '')).upper() != symbol.upper():
+                continue
+            token_price = finite_number(token.get('price'))
+            if expected_price is None or expected_price <= 0 or token_price is None or token_price <= 0:
+                continue
+            if abs(token_price / expected_price - 1) > TOP10_PRICE_TOLERANCE:
+                continue
+        candidates[(chain, normalized_address)] = token
+    if not candidates:
+        return top10_result('未找到指定链及合约' if override else '无同名且价格匹配的代币')
+    status = '指定链及合约' if override else '名称及价格匹配（待核对）'
+    if not override:
+        bsc_candidates = {key: value for key, value in candidates.items() if key[0] == '56'}
+        if bsc_candidates:
+            candidates = bsc_candidates
+            status = 'BSC优先，名称及价格匹配（待核对）'
+    if len(candidates) > 1:
+        return top10_result('同名多链/多合约，需指定地址')
+    token = next(iter(candidates.values()))
+    return top10_result(status, token)
+
+
+async def get_top10_holders(
+        session: aiohttp.ClientSession, contract: str, price: float
+) -> Dict[str, Any]:
+    override = TOP10_TOKEN_OVERRIDES.get(contract)
+    symbol, _ = top10_lookup_symbol(contract)
+    params = {'keyword': override[1] if override else symbol}
+    if override:
+        params['chainIds'] = str(override[0])
+    data = await fetch_json(session, TOP10_SEARCH_URL + '?' + urlencode(params), timeout=12)
+    return select_top10_token(data, contract, price, override)
+
+
+def format_top10(ratio: Optional[float]) -> str:
+    return '暂无数据' if ratio is None else f'{ratio:.2%}'
+
+
+async def add_top10_holders(session: aiohttp.ClientSession, results: List[Dict[str, Any]]):
+    if not results:
+        return
+    print('\n正在查询链上 Top10 持币占比（名称及价格匹配，详见 CSV 来源列）...')
+    semaphore = asyncio.Semaphore(TOP10_CONCURRENCY)
+
+    async def update(item):
+        async with semaphore:
+            await asyncio.sleep(0.3)
+            item.update(await get_top10_holders(session, item['symbol'], item['price']))
+
+    await asyncio.gather(*(update(item) for item in results))
+    count = sum(item['top10_holders_ratio'] is not None for item in results)
+    print(f'Top10 数据覆盖：{count}/{len(results)}；缺失或匹配不唯一的币种显示暂无数据。')
 
 async def get_usdt_contracts(
         session: aiohttp.ClientSession
@@ -1170,6 +1295,8 @@ async def main_async():
             if r is not None
         ]
 
+        await add_top10_holders(session, results)
+
     # ========================================================
     # 排序
     # ========================================================
@@ -1257,7 +1384,8 @@ async def main_async():
             f"${format_m(t['total_oi_value'])} "
 
             f"| 持仓市值比:"
-            f"{t['total_ratio']:.2%}"
+            f"{t['total_ratio']:.2%} "
+            f"| 链上Top10:{format_top10(t['top10_holders_ratio'])}"
         )
 
     # ========================================================
@@ -1305,6 +1433,8 @@ async def main_async():
         f"{'流通市值(M)':<12} "
 
         f"{'总持仓比':<10} "
+
+        f"{'链上Top10占比':<14} "
 
         f"{'状态/形态标记':<35}"
     )
@@ -1386,6 +1516,8 @@ async def main_async():
 
             f"{item['total_ratio']:.2%}       "
 
+            f"{format_top10(item['top10_holders_ratio']):<14} "
+
             f"{flag_str}"
         )
 
@@ -1411,6 +1543,11 @@ async def main_async():
             '流通市值(M)',
 
             '总持仓市值比',
+
+            'Top10持仓占比',
+            'Top10数据链',
+            'Top10合约地址',
+            'Top10匹配状态',
 
             '90天波段最大拉升',
 
@@ -1476,6 +1613,11 @@ async def main_async():
 
                 '90天波段最大拉升':
                     f"{item['max_90d_surge']:.2%}",
+
+                'Top10持仓占比': format_top10(item['top10_holders_ratio']),
+                'Top10数据链': item['top10_chain'],
+                'Top10合约地址': item['top10_address'],
+                'Top10匹配状态': item['top10_status'],
 
                 '是否三重底':
                     item['is_triple_bottom'],
